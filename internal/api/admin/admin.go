@@ -52,10 +52,11 @@ func (o *Api) AdminLogin(c *gin.Context) {
 		apiresp.GinError(c, err)
 		return
 	}
-	if req.Version == "" {
-		apiresp.GinError(c, errs.New("openim-admin-front version too old, please use new version").Wrap())
-		return
-	}
+	// K2IM: Skip version check for compatibility with older frontend versions
+	// if req.Version == "" {
+	// 	apiresp.GinError(c, errs.New("openim-admin-front version too old, please use new version").Wrap())
+	// 	return
+	// }
 	loginResp, err := o.adminClient.Login(c, req)
 	if err != nil {
 		apiresp.GinError(c, err)
