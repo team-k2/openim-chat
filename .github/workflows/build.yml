@@ -1,0 +1,222 @@
+name: Build and Push openim-chat
+
+on:
+  push:
+    branches:
+      - main      # Production: builds :main tag
+      - staging   # Staging: builds :staging tag (if created)
+      - dev       # Development: builds :dev tag (if created)
+      - fix/**    # Fix branches: builds :fix-branch-name tag
+    tags:
+      - 'v*.*.*'
+      - 'v*.*.*-k2im*'  # K2IM patched versions
+  pull_request:
+    branches:
+      - main
+      - staging
+      - dev
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPOSITORY: k2im/openim-chat
+  SERVICE_NAME: openim-chat
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write
+    if: |
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+       github.ref == 'refs/heads/staging' ||
+       github.ref == 'refs/heads/dev' ||
+       startsWith(github.ref, 'refs/heads/fix/') ||
+       startsWith(github.ref, 'refs/tags/'))
+
+    outputs:
+      image-tag: ${{ steps.determine-tag.outputs.tag }}
+      git-sha: ${{ github.sha }}
+      environment: ${{ steps.determine-tag.outputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine image tag and environment
+        id: determine-tag
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "tag=main" >> $GITHUB_OUTPUT
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            echo "tag=staging" >> $GITHUB_OUTPUT
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
+            echo "tag=dev" >> $GITHUB_OUTPUT
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" =~ ^refs/heads/fix/ ]]; then
+            # Extract fix branch name and sanitize for Docker tag
+            BRANCH_NAME=${GITHUB_REF#refs/heads/}
+            TAG_NAME=$(echo "$BRANCH_NAME" | sed 's/\//-/g')
+            echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" =~ ^refs/tags/v ]]; then
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+            # K2IM patched versions go to staging first, official versions to prod
+            if [[ "$TAG_NAME" =~ -k2im ]]; then
+              echo "environment=staging" >> $GITHUB_OUTPUT
+            else
+              echo "environment=prod" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.determine-tag.outputs.tag }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.determine-tag.outputs.tag }}-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.title=${{ env.SERVICE_NAME }}
+            org.opencontainers.image.vendor=K2IM
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.determine-tag.outputs.tag }}
+            org.opencontainers.image.description=OpenIM Chat with K2IM patches (etcd nil pointer fix)
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.determine-tag.outputs.tag }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.determine-tag.outputs.tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Generate build summary
+        run: |
+          echo "## Build Summary :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Service:** ${{ env.SERVICE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ steps.determine-tag.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** \`${{ steps.determine-tag.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Full Image:** \`${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.determine-tag.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Git SHA:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### K2IM Patches Applied" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ etcd nil pointer dereference fix (root.go:122)" >> $GITHUB_STEP_SUMMARY
+
+  update-manifest:
+    name: Update Infrastructure Manifest
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging' || github.ref == 'refs/heads/dev')
+    steps:
+      - name: Checkout infrastructure repo
+        uses: actions/checkout@v4
+        with:
+          repository: team-k2/k2im-infrastructure
+          ref: main
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v2
+
+      - name: Login to Amazon ECR (for image reference)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get ECR registry URL
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update image tag
+        run: |
+          OVERLAY_PATH="k8s/overlays/${{ needs.build-and-push.outputs.environment }}/openim-chat"
+
+          # Check if overlay path exists
+          if [ ! -d "$OVERLAY_PATH" ]; then
+            echo "Overlay path $OVERLAY_PATH does not exist, skipping manifest update"
+            echo "**Status:** Overlay not found, skipped update" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          cd $OVERLAY_PATH
+
+          # Update the image tag in kustomization.yaml
+          kustomize edit set image \
+            k2im/openim-chat=${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-push.outputs.image-tag }}
+
+          echo "Updated $OVERLAY_PATH with tag: ${{ needs.build-and-push.outputs.image-tag }}"
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+          OVERLAY_PATH="k8s/overlays/${{ needs.build-and-push.outputs.environment }}/openim-chat"
+
+          # Only commit if overlay exists and has changes
+          if [ -d "$OVERLAY_PATH" ]; then
+            git add $OVERLAY_PATH/kustomization.yaml
+
+            if git diff --staged --quiet; then
+              echo "No changes to commit, skipping..."
+              echo "**Status:** No changes needed" >> $GITHUB_STEP_SUMMARY
+            else
+              git commit -m "chore(${{ needs.build-and-push.outputs.environment }}/openim-chat): update image to ${{ needs.build-and-push.outputs.image-tag }}"
+              git push
+              echo "**Status:** Manifest updated successfully" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+      - name: Post update summary
+        run: |
+          echo "## :white_check_mark: Manifest Updated" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Service:** ${{ env.SERVICE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ needs.build-and-push.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**New Image Tag:** ${{ needs.build-and-push.outputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Overlay Path:** k8s/overlays/${{ needs.build-and-push.outputs.environment }}/openim-chat" >> $GITHUB_STEP_SUMMARY
