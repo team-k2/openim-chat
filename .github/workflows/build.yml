@@ -1,4 +1,4 @@
-name: Build openim-chat
+name: Build and Push openim-chat
 
 on:
   push:
@@ -8,20 +8,148 @@ on:
     branches: [main, staging, dev]
   workflow_dispatch:
 
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPOSITORY: k2im/openim-chat
+  SERVICE_NAME: openim-chat
+
 jobs:
-  build:
-    name: Build and Push
-    uses: team-k2/k2im-infrastructure/.github/workflows/reusable-build-and-push.yml@main
-    with:
-      service_name: openim-chat
-      ecr_repository: k2im/openim-chat
-      dockerfile_path: ./Dockerfile
-      build_context: .
-      dependencies: ''
-      run_tests: false  # No Go tests for openim-chat
-      run_lint: false
-      run_security_scan: true
-    secrets:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      INFRA_REPO_TOKEN: ${{ secrets.INFRA_REPO_TOKEN }}
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write
+    if: |
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+       github.ref == 'refs/heads/staging' ||
+       github.ref == 'refs/heads/dev' ||
+       startsWith(github.ref, 'refs/tags/'))
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.image_tag }}
+      git-sha: ${{ github.sha }}
+      environment: ${{ steps.meta.outputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        run: |
+          # Extract branch name and short SHA
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            # For tags, use tag name
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            BRANCH_NAME="tag"
+            SHORT_SHA=${GITHUB_SHA:0:7}
+            IMAGE_TAG="${TAG_NAME}"
+            ENVIRONMENT="prod"
+          else
+            # For branches
+            BRANCH_NAME=${GITHUB_REF#refs/heads/}
+            SHORT_SHA=${GITHUB_SHA:0:7}
+            IMAGE_TAG="${BRANCH_NAME}-${SHORT_SHA}"
+
+            # Determine environment from branch
+            if [[ "$BRANCH_NAME" == "main" ]]; then
+              ENVIRONMENT="prod"
+            elif [[ "$BRANCH_NAME" == "staging" ]]; then
+              ENVIRONMENT="staging"
+            elif [[ "$BRANCH_NAME" == "dev" ]]; then
+              ENVIRONMENT="dev"
+            else
+              ENVIRONMENT="unknown"
+            fi
+          fi
+
+          # Output all metadata
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "branch=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+
+          echo "✅ Generated image tag: $IMAGE_TAG for environment: $ENVIRONMENT"
+          echo "📦 Service: ${{ env.SERVICE_NAME }}"
+          echo "🌿 Branch: $BRANCH_NAME"
+          echo "🔖 SHA: $SHORT_SHA"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.branch }}
+          labels: |
+            org.opencontainers.image.title=${{ env.SERVICE_NAME }}
+            org.opencontainers.image.vendor=K2IM
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.image_tag }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Generate build summary
+        run: |
+          echo "## 🚀 Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Service** | \`${{ env.SERVICE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | \`${{ steps.meta.outputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image Tag** | \`${{ steps.meta.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ steps.meta.outputs.branch }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Git SHA** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Docker Image" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔄 Automated Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "ArgoCD Image Updater will automatically detect this new image and update the \`k2im-${{ steps.meta.outputs.environment }}\` environment." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Expected deployment time:** 3-5 minutes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Image Tags" >> $GITHUB_STEP_SUMMARY
+          echo "- **Immutable:** \`${{ steps.meta.outputs.image_tag }}\` (specific to this commit)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Mutable:** \`${{ steps.meta.outputs.branch }}\` (latest on this branch)" >> $GITHUB_STEP_SUMMARY
