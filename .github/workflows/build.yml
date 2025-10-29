@@ -52,7 +52,8 @@ jobs:
             # For branches
             BRANCH_NAME=${GITHUB_REF#refs/heads/}
             SHORT_SHA=${GITHUB_SHA:0:7}
-            IMAGE_TAG="${BRANCH_NAME}-${SHORT_SHA}"
+            TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
+            IMAGE_TAG="${BRANCH_NAME}-${TIMESTAMP}"
 
             # Determine environment from branch
             if [[ "$BRANCH_NAME" == "main" ]]; then
@@ -70,12 +71,14 @@ jobs:
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "branch=$BRANCH_NAME" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
           echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
 
           echo "✅ Generated image tag: $IMAGE_TAG for environment: $ENVIRONMENT"
           echo "📦 Service: ${{ env.SERVICE_NAME }}"
           echo "🌿 Branch: $BRANCH_NAME"
           echo "🔖 SHA: $SHORT_SHA"
+          echo "🕐 Timestamp: $TIMESTAMP"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
